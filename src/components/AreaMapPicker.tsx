@@ -134,6 +134,95 @@ function MapClickHandler({
   return null;
 }
 
+/** ドラッグで矩形を選択する内部コンポーネント（矩形モード時は地図のドラッグ移動を無効化） */
+function MapRectHandler({
+  enabled,
+  start,
+  onStart,
+  onPreviewEnd,
+  onConfirm,
+}: {
+  enabled: boolean;
+  start: [number, number] | null;
+  onStart: (p: [number, number]) => void;
+  onPreviewEnd: (p: [number, number]) => void;
+  onConfirm: (start: [number, number], end: [number, number]) => void;
+}) {
+  const map = useMap();
+  const [dragging, setDragging] = useState(false);
+
+  // Ensure map dragging is restored on unmount / mode change.
+  useEffect(() => {
+    if (!enabled) {
+      setDragging(false);
+      try {
+        map.dragging.enable();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    return () => {
+      setDragging(false);
+      try {
+        map.dragging.enable();
+      } catch {
+        // ignore
+      }
+    };
+  }, [enabled, map]);
+
+  useMapEvent("mousedown", (e) => {
+    if (!enabled) return;
+    // Start drag-rectangle selection and freeze map panning.
+    setDragging(true);
+    try {
+      map.dragging.disable();
+    } catch {
+      // ignore
+    }
+    const p: [number, number] = [e.latlng.lat, e.latlng.lng];
+    onStart(p);
+    onPreviewEnd(p);
+    if (e.originalEvent) {
+      e.originalEvent.preventDefault?.();
+      e.originalEvent.stopPropagation?.();
+    }
+  });
+
+  useMapEvent("mousemove", (e) => {
+    if (!enabled) return;
+    if (!dragging) return;
+    if (!start) return;
+    onPreviewEnd([e.latlng.lat, e.latlng.lng]);
+    if (e.originalEvent) {
+      e.originalEvent.preventDefault?.();
+      e.originalEvent.stopPropagation?.();
+    }
+  });
+
+  useMapEvent("mouseup", (e) => {
+    if (!enabled) return;
+    if (!dragging) return;
+    setDragging(false);
+    try {
+      map.dragging.enable();
+    } catch {
+      // ignore
+    }
+    if (!start) return;
+    const p: [number, number] = [e.latlng.lat, e.latlng.lng];
+    onPreviewEnd(p);
+    onConfirm(start, p);
+    if (e.originalEvent) {
+      e.originalEvent.preventDefault?.();
+      e.originalEvent.stopPropagation?.();
+    }
+  });
+
+  return null;
+}
+
 /** ポリゴン頂点があるときに地図の表示範囲をポリゴンに合わせる */
 function FitBoundsToPoints({
   points,
@@ -144,7 +233,7 @@ function FitBoundsToPoints({
 }) {
   const map = useMap();
   useEffect(() => {
-    if (!active || points.length < 3) return;
+    if (!active || points.length < 2) return;
     map.fitBounds(points, { padding: [24, 24], maxZoom: 14 });
   }, [map, active, points.length]);
   return null;
@@ -217,11 +306,14 @@ export function AreaMapPicker({
   initialZoom = DEFAULT_ZOOM,
   initialFootprintWkt,
 }: AreaMapPickerProps) {
-  const [mode, setMode] = useState<"polygon" | "prefecture">("polygon");
+  const [mode, setMode] = useState<"polygon" | "rect" | "prefecture">("polygon");
   const [points, setPoints] = useState<[number, number][]>(() => {
     const parsed = initialFootprintWkt ? wktToLeafletPoints(initialFootprintWkt) : null;
     return parsed ?? [];
   });
+  const [rectStart, setRectStart] = useState<[number, number] | null>(null);
+  const [rectEnd, setRectEnd] = useState<[number, number] | null>(null);
+  const [rectLocked, setRectLocked] = useState<[number, number][] | null>(null);
   const [prefecture, setPrefecture] = useState<Prefecture | null>(null);
   const [prefGeoJson, setPrefGeoJson] = useState<GeoJSON.FeatureCollection | null>(
     null
@@ -259,6 +351,42 @@ export function AreaMapPicker({
   const clearPolygon = useCallback(() => {
     setPoints([]);
   }, []);
+
+  const clearRect = useCallback(() => {
+    setRectStart(null);
+    setRectEnd(null);
+    setRectLocked(null);
+  }, []);
+
+  const confirmRect = useCallback(
+    (start: [number, number], end: [number, number]) => {
+      const minLat = Math.min(start[0], end[0]);
+      const maxLat = Math.max(start[0], end[0]);
+      const minLng = Math.min(start[1], end[1]);
+      const maxLng = Math.max(start[1], end[1]);
+      const ring: LatLng[] = [
+        [minLng, minLat],
+        [maxLng, minLat],
+        [maxLng, maxLat],
+        [minLng, maxLat],
+        [minLng, minLat],
+      ];
+      const wkt = ringToWkt(ring);
+      const { lat, lon } = ringCentroid(ring);
+      const locked: [number, number][] = [
+        [minLat, minLng],
+        [minLat, maxLng],
+        [maxLat, maxLng],
+        [maxLat, minLng],
+        [minLat, minLng],
+      ];
+      setRectLocked(locked);
+      setRectStart(null);
+      setRectEnd(null);
+      onSelect({ footprintWkt: wkt, centerLat: lat, centerLon: lon });
+    },
+    [onSelect]
+  );
 
   /** 都道府県を選択したときに GeoJSON を取得 */
   useEffect(() => {
@@ -385,6 +513,23 @@ export function AreaMapPicker({
   /** ポリゴン用の Leaflet 座標（緯度・経度の配列） */
   const latLngsPolygon = points.length >= 3 ? [...points, points[0]] : points;
 
+  /** 矩形プレビュー（開始点と現在の終点から生成） */
+  const rectPreviewPositions = useMemo(() => {
+    if (!rectStart || !rectEnd) return null;
+    const minLat = Math.min(rectStart[0], rectEnd[0]);
+    const maxLat = Math.max(rectStart[0], rectEnd[0]);
+    const minLng = Math.min(rectStart[1], rectEnd[1]);
+    const maxLng = Math.max(rectStart[1], rectEnd[1]);
+    const p: [number, number][] = [
+      [minLat, minLng],
+      [minLat, maxLng],
+      [maxLat, maxLng],
+      [maxLat, minLng],
+      [minLat, minLng],
+    ];
+    return p;
+  }, [rectStart, rectEnd]);
+
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-3">
@@ -394,6 +539,7 @@ export function AreaMapPicker({
           onClick={() => {
             setMode("polygon");
             setPoints([]);
+            clearRect();
             setPrefecture(null);
             setPrefGeoJson(null);
           }}
@@ -408,8 +554,26 @@ export function AreaMapPicker({
         <button
           type="button"
           onClick={() => {
+            setMode("rect");
+            setPoints([]);
+            clearRect();
+            setPrefecture(null);
+            setPrefGeoJson(null);
+          }}
+          className={`rounded px-3 py-1.5 text-sm ${
+            mode === "rect"
+              ? "bg-emerald-600 text-white"
+              : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+          }`}
+        >
+          矩形で選択
+        </button>
+        <button
+          type="button"
+          onClick={() => {
             setMode("prefecture");
             setPoints([]);
+            clearRect();
           }}
           className={`rounded px-3 py-1.5 text-sm ${
             mode === "prefecture"
@@ -559,6 +723,23 @@ export function AreaMapPicker({
         </div>
       )}
 
+      {mode === "rect" && (
+        <div className="flex flex-wrap items-center gap-2 text-sm text-gray-600">
+          <span>
+            地図上でドラッグして矩形を描画します（描画中は地図が動きません）。
+          </span>
+          {(rectLocked || rectStart) && (
+            <button
+              type="button"
+              onClick={clearRect}
+              className="rounded border border-gray-300 px-3 py-1.5 hover:bg-gray-50"
+            >
+              やり直す
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="h-[400px] w-full overflow-hidden rounded-lg border border-gray-300">
         <MapContainer
           center={initialCenter}
@@ -571,6 +752,10 @@ export function AreaMapPicker({
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
           <FitBoundsToPoints points={points} active={mode === "polygon" && points.length >= 3} />
+          <FitBoundsToPoints
+            points={rectLocked ?? []}
+            active={mode === "rect" && (rectLocked?.length ?? 0) >= 2}
+          />
           <FitPrefecture
             prefecture={mode === "prefecture" ? prefecture : null}
             municipality={mode === "prefecture" && !subarea ? municipality : null}
@@ -580,10 +765,23 @@ export function AreaMapPicker({
             enabled={mode === "polygon"}
             onAddPoint={addPoint}
           />
+          <MapRectHandler
+            enabled={mode === "rect"}
+            start={rectStart}
+            onStart={setRectStart}
+            onPreviewEnd={setRectEnd}
+            onConfirm={(s, e) => confirmRect(s, e)}
+          />
           {mode === "polygon" && latLngsPolygon.length >= 2 && (
             <Polygon
               positions={latLngsPolygon}
               pathOptions={{ color: "#059669", weight: 2, fillOpacity: 0.3 }}
+            />
+          )}
+          {mode === "rect" && (rectLocked || rectPreviewPositions) && (
+            <Polygon
+              positions={rectLocked ?? rectPreviewPositions ?? []}
+              pathOptions={{ color: "#059669", weight: 2, fillOpacity: 0.25 }}
             />
           )}
           {mode === "prefecture" && adminGeoJson && !subarea && (

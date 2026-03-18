@@ -29,11 +29,14 @@ export default function RootLayout({
                 <Link href="/" className="text-emerald-100 hover:text-white">
                   ホーム
                 </Link>
+                <Link href="/detect" className="text-emerald-100 hover:text-white">
+                  クイック検出
+                </Link>
                 <Link href="/areas" className="text-emerald-100 hover:text-white">
                   対象地域
                 </Link>
                 <Link href="/detections" className="text-emerald-100 hover:text-white">
-                  検出
+                  検出ジョブ
                 </Link>
                 <Link href="/scenes" className="text-emerald-100 hover:text-white">
                   衛星シーン
